@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validate, simulate, normalizeConfig } from '../src/sim.js';
+import { validate, simulate, runTolerance, normalizeConfig } from '../src/sim.js';
 
 // 场景一：宽度为 2 的短脉冲及因果链。
 // 信号源 A（NOT input，延迟 1）在第 2 刻变 1、第 4 刻变 0；
@@ -200,4 +200,164 @@ test('校验失败时 simulate 返回错误且不产出旧结论', () => {
   const res = simulate({ gates: [], edges: [], monitors: [] });
   assert.equal(res.ok, false);
   assert.equal(res.status, undefined);
+});
+
+// ---------- 边沿容差偏移复核 ----------
+
+// 与 pulseConfig 相同的链路；对 t=2 的下降沿做容差平移：
+//  -2/-1 被惯性吸收（静稳）；0 为宽度 2 临界短脉冲；+1 变宽安全；
+//  +2 与 t=4 边沿同刻，既有校验拒绝（逐点非法）。
+function toleranceConfig() {
+  return pulseConfig();
+}
+
+test('容差复核：逐偏移稳定分类、连续安全区间与最接近零风险偏移', () => {
+  const res = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: -2, upper: 2 });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.results.map((p) => [p.offset, p.kind]), [
+    [-2, 'STABLE'], [-1, 'STABLE'], [0, 'GLITCH'], [1, 'STABLE'], [2, 'INVALID'],
+  ]);
+  // 连续安全区间：[-2,-1] 与 [1,1]；+2 非法不计入。
+  assert.deepEqual(res.safeRanges, [{ lower: -2, upper: -1 }, { lower: 1, upper: 1 }]);
+  // 最接近零的风险偏移是 0（短脉冲）。
+  assert.equal(res.nearestRisk.offset, 0);
+  assert.equal(res.nearestRisk.kind, 'GLITCH');
+  assert.equal(res.counts.STABLE, 3);
+  assert.equal(res.counts.GLITCH, 1);
+  assert.equal(res.counts.INVALID, 1);
+});
+
+test('容差复核：风险点证据取自该偏移运行，与原始运行不同的偏移不复用原证据', () => {
+  // 选 t=4 的上升沿向左平移：offset -2 -> 边沿到 t=2，与另一条同刻，非法；
+  // offset 0 原始配置无脉冲；此处改为对 t=2 边沿 offset=0 才是脉冲。
+  // 直接验证：offset=0 的脉冲证据存在；安全偏移点不带 pulses/oscillation。
+  const res = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: -1, upper: 1 });
+  const at0 = res.results.find((p) => p.offset === 0);
+  const atMinus1 = res.results.find((p) => p.offset === -1);
+  assert.equal(at0.kind, 'GLITCH');
+  assert.ok(Array.isArray(at0.pulses) && at0.pulses.length === 1);
+  assert.equal(at0.pulses[0].width, 2);
+  assert.equal(at0.pulses[0].start, 5);
+  assert.equal(at0.pulses[0].end, 7);
+  // 因果链回溯到“该次运行”中仍位于 t=2 的边沿。
+  const root = at0.pulses[0].chain[0];
+  assert.equal(root.kind, 'edge');
+  assert.equal(root.t, 2);
+  assert.equal(root.input, 'a');
+  // 静稳点不携带风险证据。
+  assert.equal(atMinus1.kind, 'STABLE');
+  assert.equal(atMinus1.pulses, undefined);
+  assert.equal(atMinus1.oscillation, undefined);
+});
+
+test('容差复核：逐偏移点的脉冲证据时间随平移变化（证明非复用原始运行证据）', () => {
+  // 选 t=4 上升沿：offset +1 => t=5，脉冲展宽为 3（不再短）；
+  // offset 0 => t=4，宽度 2 短脉冲，起止 5..7；这里用另一条边（t=2）offset 0 保持宽度2。
+  // 为体现“证据来自该次运行”，选 t=4 边沿在更宽链路中直接比对：
+  const cfg = {
+    gates: [
+      { id: 'A', type: 'NOT', delay: 1, inputs: ['input:a'] },
+      { id: 'EN', type: 'NOT', delay: 1, inputs: ['input:en_n'] },
+      { id: 'Y', type: 'AND', delay: 2, inputs: ['A', 'EN'] },
+    ],
+    edges: [
+      { time: 2, input: 'a', from: 1, to: 0 },
+      { time: 5, input: 'a', from: 0, to: 1 },
+    ],
+    initialInputs: { a: '1', en_n: '0' },
+    monitors: ['Y'],
+  };
+  // 原始（t=5）间隔 3 -> 输出脉冲宽度 3，安全。把该边沿左移 1 -> t=4 -> 宽度 2 短脉冲。
+  const res = runTolerance(cfg, { edgeTime: 5, edgeInput: 'a', lower: -1, upper: 0 });
+  const at0 = res.results.find((p) => p.offset === 0);
+  const atMinus1 = res.results.find((p) => p.offset === -1);
+  assert.equal(at0.kind, 'STABLE');
+  assert.equal(atMinus1.kind, 'GLITCH');
+  assert.equal(atMinus1.pulses[0].width, 2);
+  assert.equal(atMinus1.pulses[0].start, 5);
+  assert.equal(atMinus1.pulses[0].end, 7);
+  assert.equal(atMinus1.edgeTime, 4);
+});
+
+test('容差复核：振荡偏移点携带该次运行的循环证据', () => {
+  // 反馈链在 en 上升沿后振荡；把唯一边沿右移不改变振荡，但证据 cycleStart/事件序列
+  // 必须来自该次偏移运行（平移后边沿 endTime 随之移动）。
+  const cfg = {
+    gates: [
+      { id: 'G', type: 'AND', delay: 1, inputs: ['N', 'input:en'] },
+      { id: 'N', type: 'NOT', delay: 1, inputs: ['G'] },
+    ],
+    edges: [{ time: 1, input: 'en', from: 0, to: 1 }],
+    initialInputs: { en: '0' },
+    monitors: ['G', 'N'],
+  };
+  const res = runTolerance(cfg, { edgeTime: 1, edgeInput: 'en', lower: 0, upper: 1 });
+  assert.equal(res.results[0].kind, 'OSCILLATING');
+  assert.equal(res.results[1].kind, 'OSCILLATING');
+  const o0 = res.results[0].oscillation;
+  const o1 = res.results[1].oscillation;
+  assert.ok(o0.period >= 2 && o1.period >= 2);
+  assert.ok(o1.cycleStart > o0.cycleStart || o1.events[0].t >= o0.events[0].t);
+  // 请求元数据回显原边与区间。
+  assert.deepEqual(res.request.lower, 0);
+  assert.deepEqual(res.request.upper, 1);
+  assert.equal(res.request.edge.time, 1);
+});
+
+test('容差复核：原始配置保持不变（输入对象不被修改）', () => {
+  const cfg = toleranceConfig();
+  const snapshot = JSON.stringify(cfg);
+  runTolerance(cfg, { edgeTime: 2, edgeInput: 'a', lower: -2, upper: 2 });
+  assert.equal(JSON.stringify(cfg), snapshot);
+});
+
+test('容差复核：所选边沿不存在 -> TOL_EDGE_UNKNOWN 且无结论', () => {
+  const res = runTolerance(toleranceConfig(), { edgeTime: 99, edgeInput: 'a', lower: -1, upper: 1 });
+  assert.equal(res.ok, false);
+  assert.ok(res.errors.some((e) => e.code === 'TOL_EDGE_UNKNOWN'));
+  assert.equal(res.results, undefined);
+});
+
+test('容差复核：范围非有限整数 -> TOL_RANGE_BAD', () => {
+  for (const bad of [1.5, NaN, Infinity, 'x', null, undefined]) {
+    const res = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: bad, upper: 1 });
+    assert.equal(res.ok, false, `lower=${bad}`);
+    assert.ok(res.errors.some((e) => e.code === 'TOL_RANGE_BAD'), `lower=${bad}`);
+  }
+});
+
+test('容差复核：下界大于上界 -> TOL_RANGE_ORDER', () => {
+  const res = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: 2, upper: 0 });
+  assert.equal(res.ok, false);
+  assert.ok(res.errors.some((e) => e.code === 'TOL_RANGE_ORDER'));
+});
+
+test('容差复核：偏移后负刻度 -> TOL_NEGATIVE_TICK 并清除本轮结论', () => {
+  const res = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: -3, upper: 2 });
+  assert.equal(res.ok, false);
+  assert.ok(res.errors.some((e) => e.code === 'TOL_NEGATIVE_TICK'));
+  assert.equal(res.results, undefined);
+  // 恰使刻度为 0 的下界合法。
+  const ok2 = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: -2, upper: -2 });
+  assert.equal(ok2.ok, true);
+  assert.equal(ok2.results[0].edgeTime, 0);
+});
+
+test('容差复核：同一输入在浏览器内核与接口入口得到一致的偏移排序与风险类型', async () => {
+  // 直接复用同一内核函数（页面与 /api/review 均调用 runTolerance），
+  // 验证字符串形式录入（页面收集的是字符串）也能得到与数值形式一致的结果。
+  const num = runTolerance(toleranceConfig(), { edgeTime: 2, edgeInput: 'a', lower: -2, upper: 2 });
+  const str = runTolerance(
+    {
+      gates: toleranceConfig().gates,
+      edges: toleranceConfig().edges.map((e) => ({ ...e, time: String(e.time) })),
+      initialInputs: toleranceConfig().initialInputs,
+      monitors: ['Y'],
+    },
+    { edgeTime: 2, edgeInput: 'a', lower: -2, upper: 2 },
+  );
+  const simplify = (r) => r.results.map((p) => [p.offset, p.kind, p.edgeTime]);
+  assert.deepEqual(simplify(str), simplify(num));
+  assert.deepEqual(str.safeRanges, num.safeRanges);
+  assert.deepEqual(str.nearestRisk, num.nearestRisk);
 });

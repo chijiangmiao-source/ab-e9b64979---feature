@@ -48,6 +48,23 @@
     </div>
 
     <section id="result" class="card hidden" aria-live="polite"></section>
+
+    <section class="card" id="tolCard">
+      <div class="card-head">
+        <h2>4. 边沿容差偏移复核（可选）</h2>
+      </div>
+      <p class="hint">在不改动上方原始配置的前提下，选择一条<b>已录入</b>的外部边沿，给定允许前后偏移的整数刻度范围（含边界），逐个偏移重跑惯性延迟与待发事件撤销语义。需先成功完成一次普通复核。</p>
+      <div class="tol-row">
+        <label>所选边沿
+          <select id="tolEdge"><option value="">（请先提交普通复核以载入边沿）</option></select>
+        </label>
+        <label>偏移下界 <input id="tolLower" type="number" step="1" placeholder="如 -2" style="width:96px" /></label>
+        <label>偏移上界 <input id="tolUpper" type="number" step="1" placeholder="如 2" style="width:96px" /></label>
+        <button type="button" id="tolSubmit" class="primary">运行容差复核</button>
+        <span id="tolNote" class="hint"></span>
+      </div>
+      <div id="tolResult" class="hidden" aria-live="polite"></div>
+    </section>
   </main>
 
   <footer>

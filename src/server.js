@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { simulate } from './sim.js';
+import { simulate, runTolerance } from './sim.js';
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8080);
@@ -58,7 +58,9 @@ export function createServer() {
         } catch {
           return sendJson(res, 400, { ok: false, errors: [{ code: 'BAD_JSON', message: '请求体不是合法 JSON。' }] });
         }
-        const result = simulate(config);
+        const result = config.tolerance && typeof config.tolerance === 'object'
+          ? runTolerance(config, config.tolerance)
+          : simulate(config);
         return sendJson(res, result.ok ? 200 : 422, result);
       } catch (err) {
         return sendJson(res, 500, { ok: false, errors: [{ code: 'INTERNAL', message: String(err?.message || err) }] });

@@ -65,4 +65,31 @@ ul.errors li { color: #ffc9c9; font-size: 13px; margin: 3px 0; }
 .chain { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #b9d6ff; margin: 4px 0 0; }
 .sec-title { font-size: 14px; margin: 16px 0 6px; }
 .kv { color: var(--muted); font-size: 12.5px; }
+.tol-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 10px; }
+.tol-row label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+.tol-row select, .tol-row input {
+  background: #0d141f; border: 1px solid var(--line); color: var(--txt);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px;
+}
+.tol-row select { min-width: 220px; }
+.tol-badges { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+.pill .n { font-weight: 700; }
+.pill.stable { color: var(--ok); border-color: rgba(54,201,142,.4); background: rgba(54,201,142,.12); }
+.pill.glitch, .pill.unresolved { color: var(--warn); border-color: rgba(242,184,75,.4); background: rgba(242,184,75,.12); }
+.pill.osc { color: #d39bff; border-color: rgba(190,120,255,.4); background: rgba(190,120,255,.12); }
+.pill.invalid { color: var(--bad); border-color: rgba(239,106,106,.4); background: rgba(239,106,106,.12); }
+.risk-item { border: 1px solid rgba(242,184,75,.4); border-radius: 8px; margin: 8px 0; overflow: hidden; }
+.risk-item > summary { cursor: pointer; padding: 8px 12px; font-size: 13px; list-style: revert; background: rgba(242,184,75,.07); }
+.risk-body { padding: 8px 12px 12px; }
+.tol-track { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0; }
+.tick-cell { min-width: 40px; text-align: center; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+.tick-cell .o { display: block; color: var(--muted); }
+.tick-cell.stable { border-color: rgba(54,201,142,.4); }
+.tick-cell.stable .m { color: var(--ok); }
+.tick-cell.glitch .m, .tick-cell.unresolved .m { color: var(--warn); font-weight: 700; }
+.tick-cell.osc .m { color: #d39bff; font-weight: 700; }
+.tick-cell.invalid { border-color: rgba(239,106,106,.4); }
+.tick-cell.invalid .m { color: var(--bad); }
+.tick-cell.nearest { outline: 2px solid var(--warn); }
 footer { text-align: center; color: var(--muted); font-size: 12px; padding: 16px; border-top: 1px solid var(--line); }
