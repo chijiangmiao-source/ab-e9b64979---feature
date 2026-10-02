@@ -1,4 +1,4 @@
-import { simulate } from '../src/sim.js';
+import { simulate, sweepTolerance } from '../src/sim.js';
 
 const $ = (sel) => document.querySelector(sel);
 const gateRows = $('#gateRows');
@@ -108,6 +108,15 @@ function framesTable(frames, monitors, title) {
   return `<div class="sec-title">${title}</div><table class="out"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
 }
 
+function pulsesTable(pulses) {
+  let html = `<table class="out"><thead><tr><th>输出</th><th>电平</th><th>起</th><th>止</th><th>宽度</th><th>门惯性延迟</th><th>进入/退出事件</th><th style="text-align:left">因果事件链</th></tr></thead><tbody>`;
+  html += pulses.map((p) => `<tr class="pulse-row">
+    <td>${esc(p.gate)}</td><td class="v${p.level}">${p.level}</td><td>${p.start}</td><td>${p.end}</td>
+    <td><b>${p.width}</b> 刻</td><td>${p.inertialDelay}</td><td>#${p.enterSeq} → #${p.exitSeq}</td>
+    <td style="text-align:left"><div class="chain">${chainHtml(p.chain)}</div></td></tr>`).join('');
+  return `${html}</tbody></table>`;
+}
+
 function render(result) {
   const box = $('#result');
   box.classList.remove('hidden');
@@ -123,13 +132,7 @@ function render(result) {
   html += `<p class="kv">外部边沿结束刻度：${result.endTime} ｜ 规范化配置哈希：<code>${result.normalized.hash}</code> ｜ 静稳输出：${stableLine}</p>`;
 
   if (result.pulses.length) {
-    html += `<div class="sec-title">短脉冲（${result.pulses.length} 个）</div>
-      <table class="out"><thead><tr><th>输出</th><th>电平</th><th>起</th><th>止</th><th>宽度</th><th>门惯性延迟</th><th>进入/退出事件</th><th style="text-align:left">因果事件链</th></tr></thead><tbody>`;
-    html += result.pulses.map((p) => `<tr class="pulse-row">
-      <td>${esc(p.gate)}</td><td class="v${p.level}">${p.level}</td><td>${p.start}</td><td>${p.end}</td>
-      <td><b>${p.width}</b> 刻</td><td>${p.inertialDelay}</td><td>#${p.enterSeq} → #${p.exitSeq}</td>
-      <td style="text-align:left"><div class="chain">${chainHtml(p.chain)}</div></td></tr>`).join('');
-    html += `</tbody></table>`;
+    html += `<div class="sec-title">短脉冲（${result.pulses.length} 个）</div>${pulsesTable(result.pulses)}`;
   } else {
     html += `<p class="kv">未发现短脉冲。</p>`;
   }
@@ -153,6 +156,105 @@ function render(result) {
   box.innerHTML = html;
 }
 
+const RISK_LABEL = { PULSE: '短脉冲', OSCILLATING: '振荡', UNRESOLVED: '未决', INVALID: '配置无效' };
+const fmtK = (k) => (k > 0 ? `+${k}` : `${k}`);
+
+// 从边沿表刷新可选边沿（与接口一致：按 刻度+输入名 定位）。
+function refreshTolEdges() {
+  const sel = $('#tolEdge');
+  const prev = sel.value;
+  const edges = [...edgeBody.children].map((row) => {
+    const get = (k) => row.querySelector(`[data-k="${k}"]`).value.trim();
+    return { time: get('time'), input: get('input'), from: get('from'), to: get('to') };
+  }).filter((e) => e.input && e.time !== '' && Number.isInteger(Number(e.time)));
+  sel.innerHTML = edges.map((e) => {
+    const v = esc(JSON.stringify({ time: Number(e.time), input: e.input }));
+    return `<option value="${v}">t=${esc(e.time)} · ${esc(e.input)}：${esc(e.from)}→${esc(e.to)}</option>`;
+  }).join('') || '<option value="">（暂无边沿，请先在第 2 步录入）</option>';
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function resetTolerance() {
+  $('#tolResult').innerHTML = '';
+  refreshTolEdges();
+}
+
+// 风险项证据：一律取自该偏移那次运行（脉冲时段 / 振荡循环），不回退到原始运行。
+function evidenceHtml(r, monitors) {
+  let h = '';
+  if (r.evidence?.pulses?.length) {
+    h += `<div class="sec-title">该次运行短脉冲（k=${fmtK(r.offset)}，边沿刻度 ${r.edgeTime}）</div>${pulsesTable(r.evidence.pulses)}`;
+  }
+  if (r.evidence?.oscillation) {
+    const o = r.evidence.oscillation;
+    h += `<p class="kv">该次运行振荡：循环区间 t=${o.cycleStart}…${o.cycleEnd - 1}（周期 ${o.period} 刻）｜
+      振荡门：${o.gates.map(esc).join(', ') || '—'} ｜ 循环事件标识：${o.events.map((e) => `#${e.seq}@${e.relative}`).join(', ') || '—'}<br/>
+      状态签名：<code>${esc(o.signature)}</code></p>`;
+    h += framesTable(o.prefix, monitors, '振荡前缀（该次运行）');
+    h += framesTable(o.cycle, monitors, '可回放循环（该次运行）');
+  }
+  if (r.evidence?.unresolved) {
+    const u = r.evidence.unresolved;
+    h += `<p class="kv">该次运行观察窗口耗尽（stopTick=${u.stopTick}）仍未收敛` +
+      (u.pendingAfterEnd?.length
+        ? `；结束后仍有待发事件：${u.pendingAfterEnd.map((p) => `${esc(p.gate)}→${p.to}@+${p.relativeToEnd}`).join('，')}`
+        : '') + `</p>`;
+  }
+  if (r.evidence?.errors?.length) {
+    h += `<ul class="errors">${r.evidence.errors.map((e) => `<li>[${e.code}] ${esc(e.message)}</li>`).join('')}</ul>`;
+  }
+  return h || '<p class="kv">无证据。</p>';
+}
+
+function renderTolerance(res) {
+  const box = $('#tolResult');
+  if (!res.ok) {
+    // 明确说明错误并清除本轮容差结论；上方普通复核结论不受影响。
+    box.innerHTML = `<h3 class="tol-head"><span class="badge err">容差复核未执行 · 本轮容差结论已清除</span></h3>
+      <ul class="errors">${res.errors.map((e) => `<li>[${e.code}] ${esc(e.message)}</li>`).join('')}</ul>`;
+    return;
+  }
+  const c = res.counts;
+  const fmtInterval = (iv) => (iv.from === iv.to ? `[${fmtK(iv.from)}]` : `[${fmtK(iv.from)}, ${fmtK(iv.to)}]`);
+  const safeText = res.safeIntervals.length ? res.safeIntervals.map(fmtInterval).join('、') : '无';
+  const near = res.nearestRisk;
+  const nearText = near
+    ? `k=${fmtK(near.offset)}（${RISK_LABEL[near.risk]}，偏移后边沿刻度 ${near.edgeTime}）`
+    : '无（扫描范围内全部静稳）';
+  const byKind = ['PULSE', 'OSCILLATING', 'UNRESOLVED']
+    .map((k) => `${RISK_LABEL[k]}：${res.nearestByRisk[k] !== undefined ? `k=${fmtK(res.nearestByRisk[k])}` : '无'}`).join(' ｜ ');
+
+  let html = `<h3 class="tol-head"><span class="badge ${near ? 'osc' : 'stable'}">容差复核完成</span></h3>
+    <p class="kv">边沿 t=${res.edge.time} ${esc(res.edge.input)}（${res.edge.from}→${res.edge.to}）｜
+    偏移范围 [${fmtK(res.offsets.from)}, ${fmtK(res.offsets.to)}] 共 ${c.total} 个：
+    静稳 ${c.safe || 0} · 短脉冲 ${c.PULSE || 0} · 振荡 ${c.OSCILLATING || 0} · 未决 ${c.UNRESOLVED || 0}${c.INVALID ? ` · 无效 ${c.INVALID}` : ''}</p>
+    <p class="kv"><b>连续安全偏移区间：</b>${safeText}<br/>
+    <b>最接近零的风险偏移：</b>${nearText}<br/>
+    <b>各风险类型最近偏移：</b>${byKind}</p>`;
+  html += `<table class="out"><thead><tr><th>偏移 k</th><th>边沿刻度</th><th>结论</th><th style="text-align:left">该次运行证据</th></tr></thead><tbody>`;
+  for (const r of res.results) {
+    const label = r.risk ? RISK_LABEL[r.risk] : '静稳';
+    const cls = r.risk === 'PULSE' ? 'pulse-row' : r.risk === 'OSCILLATING' ? 'osc-row' : r.risk ? 'err-row' : '';
+    const detail = r.risk
+      ? `<details><summary>展开该次运行证据</summary>${evidenceHtml(r, res.monitors)}</details>`
+      : '—';
+    html += `<tr class="${cls}"><td>${fmtK(r.offset)}</td><td>${r.edgeTime}</td><td>${label}</td><td style="text-align:left">${detail}</td></tr>`;
+  }
+  box.innerHTML = `${html}</tbody></table>`;
+}
+
+$('#tolRun').addEventListener('click', () => {
+  refreshTolEdges();
+  let edge = null;
+  try { edge = JSON.parse($('#tolEdge').value); } catch { edge = null; }
+  const spec = { edge, offsets: { from: $('#tolFrom').value, to: $('#tolTo').value } };
+  try {
+    renderTolerance(sweepTolerance(collectConfig(), spec));
+  } catch (err) {
+    renderTolerance({ ok: false, errors: [{ code: 'INTERNAL', message: String(err?.stack || err) }] });
+  }
+});
+
 $('#addGate').addEventListener('click', () => gateRows.appendChild(gateRowHtml({ type: 'AND', delay: 1 })));
 $('#addEdge').addEventListener('click', () => edgeBody.appendChild(edgeRowHtml()));
 $('#clear').addEventListener('click', () => {
@@ -163,11 +265,13 @@ $('#clear').addEventListener('click', () => {
   $('#initialInputs').value = '';
   $('#result').classList.add('hidden');
   hydrate(null);
+  resetTolerance();
   $('#draftNote').textContent = '草稿已清空。';
 });
 $('#submit').addEventListener('click', () => {
   saveDraft();
   $('#draftNote').textContent = '';
+  resetTolerance(); // 新一轮复核：清除上一轮容差结论并按当前边沿表刷新可选项
   const config = collectConfig();
   try {
     render(simulate(config));
@@ -177,3 +281,4 @@ $('#submit').addEventListener('click', () => {
 });
 
 hydrate(loadDraft());
+refreshTolEdges();

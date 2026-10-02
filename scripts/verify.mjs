@@ -2,14 +2,16 @@
 // 顺序：
 //  1) 规定场景断言：宽度 2 短脉冲及因果链；
 //     延迟 3 的 NOT 在第 0/1 刻反转时撤销第 3 刻失效翻转；
-//     正延迟反馈链振荡证据（稳定门 + 事件标识，可回放）。
+//     正延迟反馈链振荡证据（稳定门 + 事件标识，可回放）；
+//     容差复核：连续安全偏移区间、最接近零的首个短脉冲偏移、非法负刻度边界。
 //  2) 代码测试（node --test）。
 //  3) 页面构建（npm run build）。
-//  4) 在可配置宿主端口启动服务，做 /health 与 /api/review 的 HTTP 冒烟。
+//  4) 在可配置宿主端口启动服务，做 /health 与 /api/review 的 HTTP 冒烟，
+//     并核对容差复核接口入口与内核的偏移排序、风险类型一致。
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { simulate } from '../src/sim.js';
+import { simulate, sweepTolerance } from '../src/sim.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8091);
@@ -90,6 +92,57 @@ console.log('[1/4] 规定场景断言');
   ok('振荡门包含反馈链上的门', o?.gates?.includes('G') || o?.gates?.includes('N'));
 }
 
+// 场景 D：容差复核 —— 连续安全偏移区间与最接近零的首个短脉冲偏移。
+// NOT（延迟 3）监测 x：t=10 拉高、t=20 拉低。偏移 t=20 下降沿：
+// k=-8 扰动短于延迟被撤销（安全）；k=-7 输出 [13,16) 宽 3 的临界短脉冲；k≥-6 脉冲更宽（安全）。
+const tolCfg = {
+  gates: [{ id: 'N', type: 'NOT', delay: 3, inputs: ['input:x'] }],
+  edges: [
+    { time: 10, input: 'x', from: 0, to: 1 },
+    { time: 20, input: 'x', from: 1, to: 0 },
+  ],
+  initialInputs: { x: '0' },
+  monitors: ['N'],
+};
+const tolSpec = { edge: { time: 20, input: 'x' }, offsets: { from: -8, to: 4 } };
+{
+  const tol = sweepTolerance(tolCfg, tolSpec);
+  ok('容差扫描成功', tol.ok === true, JSON.stringify(tol.errors));
+  ok('偏移结果按偏移值升序稳定排列',
+    tol.ok && tol.results.length === 13 && tol.results.every((r, i) => r.offset === -8 + i && r.edgeTime === 20 + r.offset));
+  ok('连续安全偏移区间为 [-8,-8] 与 [-6,+4]',
+    tol.ok && JSON.stringify(tol.safeIntervals) === JSON.stringify([{ from: -8, to: -8 }, { from: -6, to: 4 }]),
+    JSON.stringify(tol.safeIntervals));
+  ok('最接近零的风险偏移为首个短脉冲偏移 k=-7',
+    tol.ok && tol.nearestRisk?.offset === -7 && tol.nearestRisk?.risk === 'PULSE' && tol.nearestByRisk?.PULSE === -7,
+    JSON.stringify(tol.nearestRisk));
+  const risk = tol.ok && tol.results.find((r) => r.offset === -7);
+  ok('首个短脉冲偏移复用该次运行的脉冲证据（[13,16) 宽 3，非原始运行的宽 10）',
+    risk && risk.evidence?.pulses?.[0]?.start === 13 && risk.evidence.pulses[0].end === 16 && risk.evidence.pulses[0].width === 3,
+    JSON.stringify(risk?.evidence?.pulses));
+}
+
+// 场景 E：容差复核 —— 非法负刻度边界及其余明确错误；普通复核不受影响。
+{
+  const neg = sweepTolerance(tolCfg, { edge: { time: 10, input: 'x' }, offsets: { from: -11, to: -5 } });
+  ok('偏移使边沿刻度为负：报 TOLERANCE_NEGATIVE_TICK 且无本轮结论',
+    neg.ok === false && neg.errors.some((e) => e.code === 'TOLERANCE_NEGATIVE_TICK') && !neg.results,
+    JSON.stringify(neg.errors));
+  const edge0 = sweepTolerance(tolCfg, { edge: { time: 10, input: 'x' }, offsets: { from: -10, to: -10 } });
+  ok('边界 k=-10（偏移后刻度恰为 0）合法', edge0.ok === true && edge0.results?.[0]?.edgeTime === 0);
+  const noEdge = sweepTolerance(tolCfg, { edge: { time: 99, input: 'x' }, offsets: { from: 0, to: 1 } });
+  ok('所选边沿不存在：报 TOLERANCE_EDGE_NOT_FOUND',
+    noEdge.ok === false && noEdge.errors[0]?.code === 'TOLERANCE_EDGE_NOT_FOUND' && !noEdge.results);
+  const badRange = sweepTolerance(tolCfg, { edge: { time: 10, input: 'x' }, offsets: { from: 1.5, to: 2 } });
+  ok('范围非有限整数：报 TOLERANCE_RANGE_BAD',
+    badRange.ok === false && badRange.errors[0]?.code === 'TOLERANCE_RANGE_BAD');
+  const inverted = sweepTolerance(tolCfg, { edge: { time: 10, input: 'x' }, offsets: { from: 2, to: -2 } });
+  ok('下界大于上界：报 TOLERANCE_RANGE_INVERTED',
+    inverted.ok === false && inverted.errors[0]?.code === 'TOLERANCE_RANGE_INVERTED');
+  const base = simulate(tolCfg);
+  ok('容差错误后普通复核仍照常可用', base.ok === true && base.status === 'STABLE');
+}
+
 console.log('[2/4] 代码测试');
 const run = (cmd, args) => new Promise((resolve) => {
   const p = spawn(cmd, args, { stdio: 'inherit', shell: process.platform === 'win32' });
@@ -138,6 +191,35 @@ console.log(`[4/4] HTTP 冒烟（宿主 ${HOST}:${PORT}）`);
     const body = await pr.json();
     reviewOk = pr.status === 200 && body.ok && body.status === 'STABLE' && body.stableValues.N === '1';
     ok('POST /api/review 返回静稳结论（撤销场景）', reviewOk);
+
+    // 容差复核接口入口：与内核直接调用同一输入，偏移排序与风险类型必须一致。
+    const tr = await fetch(`http://${HOST}:${PORT}/api/review`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...tolCfg, tolerance: tolSpec }),
+    });
+    const tj = await tr.json();
+    const direct = sweepTolerance(tolCfg, tolSpec);
+    ok('接口容差结论与内核一致（偏移排序）',
+      tr.status === 200 && tj.ok === true && tj.tolerance?.ok === true &&
+      JSON.stringify(tj.tolerance.results.map((r) => r.offset)) === JSON.stringify(direct.results.map((r) => r.offset)));
+    ok('接口容差结论与内核一致（风险类型与安全区间）',
+      tr.status === 200 &&
+      JSON.stringify(tj.tolerance.results.map((r) => r.risk)) === JSON.stringify(direct.results.map((r) => r.risk)) &&
+      JSON.stringify(tj.tolerance.safeIntervals) === JSON.stringify(direct.safeIntervals) &&
+      JSON.stringify(tj.tolerance.nearestRisk) === JSON.stringify(direct.nearestRisk));
+
+    // 容差错误只清除本轮容差结论：接口仍返回普通复核结论（200）。
+    const br = await fetch(`http://${HOST}:${PORT}/api/review`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...tolCfg, tolerance: { edge: { time: 10, input: 'x' }, offsets: { from: -11, to: 0 } } }),
+    });
+    const bj = await br.json();
+    ok('容差错误不影响接口普通复核结论',
+      br.status === 200 && bj.ok === true && bj.tolerance?.ok === false &&
+      bj.tolerance.errors.some((e) => e.code === 'TOLERANCE_NEGATIVE_TICK') && !bj.tolerance.results,
+      `HTTP ${br.status} ${JSON.stringify(bj.tolerance?.errors)}`);
 
     const page = await fetch(`http://${HOST}:${PORT}/`);
     const html = await page.text();

@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { simulate } from './sim.js';
+import { simulate, sweepTolerance } from './sim.js';
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8080);
@@ -59,6 +59,11 @@ export function createServer() {
           return sendJson(res, 400, { ok: false, errors: [{ code: 'BAD_JSON', message: '请求体不是合法 JSON。' }] });
         }
         const result = simulate(config);
+        // 可选的开关抖动容差复核：与页面共用同一 sweepTolerance 内核，
+        // 容差错误只写入 tolerance 字段，不影响普通复核结论与状态码。
+        if (config && typeof config === 'object' && config.tolerance != null) {
+          result.tolerance = sweepTolerance(config, config.tolerance);
+        }
         return sendJson(res, result.ok ? 200 : 422, result);
       } catch (err) {
         return sendJson(res, 500, { ok: false, errors: [{ code: 'INTERNAL', message: String(err?.message || err) }] });

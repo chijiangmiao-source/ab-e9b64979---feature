@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validate, simulate, normalizeConfig } from '../src/sim.js';
+import { validate, simulate, normalizeConfig, sweepTolerance } from '../src/sim.js';
 
 // 场景一：宽度为 2 的短脉冲及因果链。
 // 信号源 A（NOT input，延迟 1）在第 2 刻变 1、第 4 刻变 0；
@@ -200,4 +200,137 @@ test('校验失败时 simulate 返回错误且不产出旧结论', () => {
   const res = simulate({ gates: [], edges: [], monitors: [] });
   assert.equal(res.ok, false);
   assert.equal(res.status, undefined);
+});
+
+// 容差复核场景：NOT（延迟 3）监测 x；x 在 t=10 拉高、t=20 拉低。
+// 偏移 t=20 的下降沿：k=-7 时输入高电平窗口恰好撑满 3 刻，输出 [13,16) 宽度 3 的临界短脉冲；
+// k=-8 时扰动短于延迟被撤销（安全）；k≥-6 时输出脉冲宽于延迟（安全）。
+function tolConfig() {
+  return {
+    gates: [{ id: 'N', type: 'NOT', delay: 3, inputs: ['input:x'] }],
+    edges: [
+      { time: 10, input: 'x', from: 0, to: 1 },
+      { time: 20, input: 'x', from: 1, to: 0 },
+    ],
+    initialInputs: { x: '0' },
+    monitors: ['N'],
+  };
+}
+
+test('容差复核：连续安全区间与最接近零的首个短脉冲偏移', () => {
+  const cfg = tolConfig();
+  const snapshot = JSON.stringify(cfg);
+  const tol = sweepTolerance(cfg, { edge: { time: 20, input: 'x' }, offsets: { from: -8, to: 4 } });
+  assert.equal(tol.ok, true);
+  // 偏移结果按偏移值升序稳定排列
+  assert.equal(tol.results.length, 13);
+  assert.ok(tol.results.every((r, i) => r.offset === -8 + i && r.edgeTime === 20 + r.offset));
+  // 连续安全偏移区间
+  assert.deepEqual(tol.safeIntervals, [{ from: -8, to: -8 }, { from: -6, to: 4 }]);
+  // 最接近零的风险偏移即首个短脉冲偏移 k=-7
+  assert.deepEqual(tol.nearestRisk, { offset: -7, edgeTime: 13, risk: 'PULSE' });
+  assert.equal(tol.nearestByRisk.PULSE, -7);
+  assert.equal(tol.counts.safe, 12);
+  assert.equal(tol.counts.PULSE, 1);
+  // 风险项证据来自该次运行（宽 3 的 [13,16)），而非原始运行（宽 10 的 [13,23)）
+  const risk = tol.results.find((r) => r.offset === -7);
+  assert.equal(risk.evidence.pulses.length, 1);
+  assert.equal(risk.evidence.pulses[0].start, 13);
+  assert.equal(risk.evidence.pulses[0].end, 16);
+  assert.equal(risk.evidence.pulses[0].width, 3);
+  const base = simulate(cfg);
+  assert.equal(base.pulses.length, 0, '原始运行没有短脉冲，容差证据不可能复用自原始运行');
+  // 原始配置保持不变
+  assert.equal(JSON.stringify(cfg), snapshot);
+});
+
+test('容差复核：振荡风险偏移携带该次运行的循环证据', () => {
+  const cfg = {
+    gates: [
+      { id: 'G', type: 'AND', delay: 1, inputs: ['N', 'input:en'] },
+      { id: 'N', type: 'NOT', delay: 1, inputs: ['G'] },
+    ],
+    edges: [{ time: 2, input: 'en', from: 0, to: 1 }],
+    initialInputs: { en: '0' },
+    monitors: ['G', 'N'],
+  };
+  const tol = sweepTolerance(cfg, { edge: { time: 2, input: 'en' }, offsets: { from: -2, to: 2 } });
+  assert.equal(tol.ok, true);
+  assert.equal(tol.safeIntervals.length, 0);
+  assert.equal(tol.counts.OSCILLATING, 5);
+  assert.equal(tol.nearestRisk.offset, 0);
+  assert.equal(tol.nearestRisk.risk, 'OSCILLATING');
+  const r0 = tol.results.find((r) => r.offset === 0);
+  assert.ok(r0.evidence.oscillation.period >= 2);
+  assert.ok(r0.evidence.oscillation.cycle.length > 0);
+});
+
+test('容差复核：观察窗口耗尽记为未决风险', () => {
+  const cfg = {
+    gates: [{ id: 'N', type: 'NOT', delay: 3, inputs: ['input:x'] }],
+    edges: [{ time: 0, input: 'x', from: 0, to: 1 }],
+    initialInputs: { x: '0' },
+    monitors: ['N'],
+  };
+  const tol = sweepTolerance(cfg, { edge: { time: 0, input: 'x' }, offsets: { from: 0, to: 0 } }, { maxTicks: 2 });
+  assert.equal(tol.ok, true);
+  assert.equal(tol.results[0].risk, 'UNRESOLVED');
+  assert.equal(tol.results[0].evidence.unresolved.stopTick, 2);
+});
+
+test('容差复核：偏移后边沿与他人撞车记为无效而非安全', () => {
+  const cfg = {
+    gates: [{ id: 'N', type: 'NOT', delay: 1, inputs: ['input:x'] }],
+    edges: [
+      { time: 2, input: 'x', from: 0, to: 1 },
+      { time: 4, input: 'x', from: 1, to: 0 },
+    ],
+    initialInputs: { x: '0' },
+    monitors: ['N'],
+  };
+  const tol = sweepTolerance(cfg, { edge: { time: 2, input: 'x' }, offsets: { from: 0, to: 3 } });
+  assert.equal(tol.ok, true);
+  const dup = tol.results.find((r) => r.offset === 2);
+  assert.equal(dup.risk, 'INVALID');
+  assert.ok(dup.evidence.errors.some((e) => e.code === 'EDGE_BAD'));
+  // k=1 为短脉冲风险，k=2 撞车无效，k=0 与 k=3 静稳安全
+  assert.equal(tol.results.find((r) => r.offset === 1).risk, 'PULSE');
+  assert.deepEqual(tol.safeIntervals, [{ from: 0, to: 0 }, { from: 3, to: 3 }]);
+});
+
+test('容差复核：所选边沿不存在 / 范围非有限整数 / 下界大于上界', () => {
+  const cfg = tolConfig();
+  const noEdge = sweepTolerance(cfg, { edge: { time: 99, input: 'x' }, offsets: { from: 0, to: 1 } });
+  assert.equal(noEdge.ok, false);
+  assert.equal(noEdge.errors[0].code, 'TOLERANCE_EDGE_NOT_FOUND');
+  assert.equal(noEdge.results, undefined, '出错时不得残留本轮容差结论');
+
+  for (const offsets of [{ from: 1.5, to: 2 }, { from: 'x', to: 2 }, { from: '', to: 2 }, { from: 0, to: Infinity }]) {
+    const r = sweepTolerance(cfg, { edge: { time: 20, input: 'x' }, offsets });
+    assert.equal(r.ok, false, JSON.stringify(offsets));
+    assert.equal(r.errors[0].code, 'TOLERANCE_RANGE_BAD');
+  }
+  const inv = sweepTolerance(cfg, { edge: { time: 20, input: 'x' }, offsets: { from: 2, to: -2 } });
+  assert.equal(inv.ok, false);
+  assert.equal(inv.errors[0].code, 'TOLERANCE_RANGE_INVERTED');
+
+  const baseBad = sweepTolerance({ gates: [], edges: [], monitors: [] }, { edge: { time: 0, input: 'x' }, offsets: { from: 0, to: 1 } });
+  assert.equal(baseBad.ok, false);
+  assert.equal(baseBad.errors[0].code, 'TOLERANCE_BASE_INVALID');
+});
+
+test('容差复核：偏移后使边沿刻度为负的边界', () => {
+  const cfg = tolConfig();
+  const neg = sweepTolerance(cfg, { edge: { time: 10, input: 'x' }, offsets: { from: -11, to: -5 } });
+  assert.equal(neg.ok, false);
+  assert.equal(neg.errors[0].code, 'TOLERANCE_NEGATIVE_TICK');
+  assert.equal(neg.results, undefined);
+  // 边界 k=-10 使刻度恰好为 0：合法
+  const edge0 = sweepTolerance(cfg, { edge: { time: 10, input: 'x' }, offsets: { from: -10, to: -10 } });
+  assert.equal(edge0.ok, true);
+  assert.equal(edge0.results[0].edgeTime, 0);
+  // 容差错误不影响普通复核
+  const base = simulate(cfg);
+  assert.equal(base.ok, true);
+  assert.equal(base.status, 'STABLE');
 });

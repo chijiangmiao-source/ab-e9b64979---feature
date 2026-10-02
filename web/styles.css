@@ -60,6 +60,18 @@ table.out th { color: var(--muted); font-weight: 500; background: #131d2a; }
 td.v1 { color: var(--ok); font-weight: 700; }
 td.v0 { color: var(--muted); }
 .pulse-row { background: rgba(242,184,75,.08); }
+.osc-row { background: rgba(242,184,75,.14); }
+.err-row { background: rgba(239,106,106,.10); }
+.tol-form { display: grid; grid-template-columns: 1fr 170px 170px; gap: 10px; align-items: end; }
+.tol-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.tol-form select, .tol-form input {
+  width: 100%; background: #0d141f; border: 1px solid var(--line); color: var(--txt);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px;
+}
+.tol-head { font-size: 14px; margin: 14px 0 6px; }
+details { margin: 2px 0; }
+details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
+details[open] summary { margin-bottom: 6px; }
 ul.errors { margin: 8px 0 0; padding-left: 18px; }
 ul.errors li { color: #ffc9c9; font-size: 13px; margin: 3px 0; }
 .chain { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #b9d6ff; margin: 4px 0 0; }

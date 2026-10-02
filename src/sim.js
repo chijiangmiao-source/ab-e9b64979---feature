@@ -556,6 +556,149 @@ function detectPulses(timeline, monitors, gateMap, eventsLog, edges) {
   return pulses.sort((a, b) => a.start - b.start || a.gate.localeCompare(b.gate));
 }
 
+/** 单次容差扫描允许的最大偏移个数（防止过宽范围造成长时间计算）。 */
+export const TOLERANCE_MAX_OFFSETS = 401;
+
+const normIntOrNull = (v) => {
+  if (v === '' || v === null || v === undefined || typeof v === 'boolean') return null;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : null; // isInteger 已排除 NaN 与 ±Infinity
+};
+
+/**
+ * 开关抖动容差复核：保持原始配置不变，对所选外部边沿逐个施加整数偏移 k∈[from,to]，
+ * 以偏移后的边沿重新执行既有惯性延迟与待发事件撤销语义，并按偏移值升序稳定汇总。
+ *
+ * spec: { edge: { time, input }, offsets: { from, to } }
+ * 返回：
+ *  - ok:false + errors（所选边沿不存在 / 范围非有限整数 / 下界大于上界 / 偏移后刻度为负 /
+ *    基础配置非法 / 范围过宽）；此时不产出任何本轮容差结论。
+ *  - ok:true + results（每偏移 {offset,edgeTime,status,pulseCount,risk,evidence?}）、
+ *    safeIntervals（连续安全偏移区间）、nearestRisk（最接近零的风险偏移）、
+ *    nearestByRisk、counts。risk∈{null,'PULSE','OSCILLATING','UNRESOLVED','INVALID'}，
+ *    优先级 PULSE > OSCILLATING > UNRESOLVED；安全即 risk===null（静稳且无短脉冲）。
+ *    风险项 evidence 取自该偏移那次运行的脉冲时段 / 振荡循环，绝不用原始运行替代。
+ */
+export function sweepTolerance(config, spec, options = {}) {
+  const fail = (code, message, extra = {}) => ({ ok: false, errors: [{ code, message }], ...extra });
+
+  // 1) 偏移范围必须是有限整数。
+  const lo = normIntOrNull(spec?.offsets?.from);
+  const hi = normIntOrNull(spec?.offsets?.to);
+  if (lo === null || hi === null) {
+    return fail('TOLERANCE_RANGE_BAD',
+      `偏移范围必须是有限整数刻度（收到 from=${JSON.stringify(spec?.offsets?.from)}，to=${JSON.stringify(spec?.offsets?.to)}）。`);
+  }
+  if (lo > hi) {
+    return fail('TOLERANCE_RANGE_INVERTED', `偏移下界 ${lo} 大于上界 ${hi}，范围非法。`);
+  }
+  if (hi - lo + 1 > TOLERANCE_MAX_OFFSETS) {
+    return fail('TOLERANCE_RANGE_TOO_WIDE',
+      `偏移范围共 ${hi - lo + 1} 个刻度，超过单次上限 ${TOLERANCE_MAX_OFFSETS}；请缩小范围。`);
+  }
+
+  // 2) 基础配置须通过既有校验（普通复核结论不可用时不做容差扫描）。
+  const check = validate(config);
+  if (!check.ok) {
+    return fail('TOLERANCE_BASE_INVALID',
+      '基础配置未通过校验，无法执行容差复核；请先修正配置错误。', { baseErrors: check.errors });
+  }
+  const model = check.model;
+
+  // 3) 所选边沿必须已录入。
+  const selTime = normIntOrNull(spec?.edge?.time);
+  const selInput = String(spec?.edge?.input ?? '').trim();
+  const target = (selTime !== null && selInput)
+    ? model.edges.find((e) => e.time === selTime && e.input === selInput)
+    : null;
+  if (!target) {
+    return fail('TOLERANCE_EDGE_NOT_FOUND',
+      `所选外部边沿不存在：t=${JSON.stringify(spec?.edge?.time)}、input=${JSON.stringify(spec?.edge?.input ?? '')}；请从已录入的边沿中选择。`);
+  }
+
+  // 4) 偏移后边沿刻度不得为负（范围连续，只需检验下界）。
+  if (target.time + lo < 0) {
+    return fail('TOLERANCE_NEGATIVE_TICK',
+      `偏移下界 ${lo} 使所选边沿（原刻度 ${target.time}）刻度变为 ${target.time + lo}（负值），非法；请抬高偏移下界。`);
+  }
+
+  // 原始配置保持不变：在录入的边沿表副本上定位目标边沿，仅替换其刻度。
+  const rawEdges = Array.isArray(config?.edges) ? config.edges : [];
+  let rawIdx = -1;
+  for (let i = 0; i < rawEdges.length; i++) {
+    const e = rawEdges[i] || {};
+    if (normIntOrNull(e.time ?? null) === target.time &&
+        String(e.input ?? e.name ?? '').trim() === target.input) { rawIdx = i; break; }
+  }
+  const shiftedConfig = (k) => ({
+    ...config,
+    edges: rawEdges.map((e, i) => (i === rawIdx
+      ? { time: target.time + k, input: target.input, from: target.from, to: target.to }
+      : e)),
+  });
+
+  const maxTicks = options.maxTicks ?? 4096;
+  const results = [];
+  for (let k = lo; k <= hi; k++) {
+    const res = simulate(shiftedConfig(k), { maxTicks });
+    results.push(classifyOffset(k, target.time + k, res));
+  }
+
+  // 连续安全偏移区间（结果已按偏移升序，相邻安全偏移直接合并）。
+  const safeIntervals = [];
+  for (const r of results) {
+    if (r.risk !== null) continue;
+    const last = safeIntervals[safeIntervals.length - 1];
+    if (last && last.to === r.offset - 1) last.to = r.offset;
+    else safeIntervals.push({ from: r.offset, to: r.offset });
+  }
+
+  // 最接近零的风险偏移：|k| 最小，并列取较小 k，保证确定稳定。
+  const byNearness = (a, b) => Math.abs(a.offset) - Math.abs(b.offset) || a.offset - b.offset;
+  const riskResults = results.filter((r) => r.risk !== null);
+  const nearest = riskResults.slice().sort(byNearness)[0] ?? null;
+  const nearestByRisk = {};
+  for (const kind of ['PULSE', 'OSCILLATING', 'UNRESOLVED', 'INVALID']) {
+    const first = riskResults.filter((r) => r.risk === kind).sort(byNearness)[0];
+    if (first) nearestByRisk[kind] = first.offset;
+  }
+  const counts = { total: results.length, safe: results.length - riskResults.length };
+  for (const r of riskResults) counts[r.risk] = (counts[r.risk] ?? 0) + 1;
+
+  return {
+    ok: true,
+    edge: { time: target.time, input: target.input, from: target.from, to: target.to },
+    offsets: { from: lo, to: hi },
+    monitors: [...model.monitors],
+    results,
+    safeIntervals,
+    nearestRisk: nearest ? { offset: nearest.offset, edgeTime: nearest.edgeTime, risk: nearest.risk } : null,
+    nearestByRisk,
+    counts,
+  };
+}
+
+function classifyOffset(offset, edgeTime, res) {
+  if (!res.ok) {
+    // 偏移后配置自身非法（如与其他边沿撞车）：不是安全结论，单列 INVALID。
+    return { offset, edgeTime, status: 'INVALID', pulseCount: 0, risk: 'INVALID', evidence: { errors: res.errors } };
+  }
+  const pulseCount = res.pulses.length;
+  let risk = null;
+  if (pulseCount > 0) risk = 'PULSE';
+  else if (res.status === 'OSCILLATING') risk = 'OSCILLATING';
+  else if (res.status === 'UNRESOLVED') risk = 'UNRESOLVED';
+  const rec = { offset, edgeTime, status: res.status, pulseCount, risk };
+  if (risk !== null) {
+    const evidence = {};
+    if (pulseCount > 0) evidence.pulses = res.pulses;
+    if (res.status === 'OSCILLATING') evidence.oscillation = res.oscillation;
+    if (res.status === 'UNRESOLVED') evidence.unresolved = { stopTick: res.stopTick, pendingAfterEnd: res.pendingAfterEnd };
+    rec.evidence = evidence;
+  }
+  return rec;
+}
+
 /** 规范化配置：门按标识排序、连线归一化、边沿/初值归一化，并生成去重哈希。 */
 export function normalizeConfig(config) {
   const check = validate(config);

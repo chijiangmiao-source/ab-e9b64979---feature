@@ -48,6 +48,26 @@
     </div>
 
     <section id="result" class="card hidden" aria-live="polite"></section>
+
+    <section class="card" id="toleranceCard">
+      <div class="card-head">
+        <h2>4. 开关抖动容差复核（可选）</h2>
+        <button type="button" id="tolRun" class="ghost">执行容差复核</button>
+      </div>
+      <div class="tol-form">
+        <label>外部边沿
+          <select id="tolEdge"></select>
+        </label>
+        <label>偏移下界（整数刻度）
+          <input id="tolFrom" type="number" step="1" value="-8" />
+        </label>
+        <label>偏移上界（整数刻度）
+          <input id="tolTo" type="number" step="1" value="4" />
+        </label>
+      </div>
+      <p class="hint">保持原始配置不变，对所选边沿逐个施加偏移并重跑惯性延迟与待发事件撤销语义；偏移后刻度不得为负。风险项可展开查看该次运行的脉冲时段 / 振荡循环证据。</p>
+      <div id="tolResult" aria-live="polite"></div>
+    </section>
   </main>
 
   <footer>
